@@ -24,6 +24,7 @@
 /* USER CODE BEGIN Includes */
 
 #include <stdio.h>
+#include "bme280.h"
 
 /* USER CODE END Includes */
 
@@ -59,7 +60,7 @@ osThreadId_t PrintTaskHandle;
 const osThreadAttr_t PrintTask_attributes = {
   .name = "PrintTask",
   .stack_size = 512 * 4,
-  .priority = (osPriority_t) osPriorityBelowNormal1,
+  .priority = (osPriority_t) osPriorityBelowNormal,
 };
 /* USER CODE BEGIN PV */
 
@@ -84,6 +85,33 @@ int __io_putchar(int ch)
 {
     HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
     return ch;
+}
+
+static uint8_t bme_addr = BME280_I2C_ADDR_PRIM;   /* 0x76 */
+
+BME280_INTF_RET_TYPE bme_i2c_read(uint8_t reg, uint8_t *data,
+                                  uint32_t len, void *intf_ptr)
+{
+  uint8_t addr = *(uint8_t *)intf_ptr;
+  if (HAL_I2C_Mem_Read(&hi2c1, addr << 1, reg, I2C_MEMADD_SIZE_8BIT,
+                       data, (uint16_t)len, 100) == HAL_OK)
+    return BME280_INTF_RET_SUCCESS;
+  return -1;
+}
+
+BME280_INTF_RET_TYPE bme_i2c_write(uint8_t reg, const uint8_t *data,
+                                   uint32_t len, void *intf_ptr)
+{
+  uint8_t addr = *(uint8_t *)intf_ptr;
+  if (HAL_I2C_Mem_Write(&hi2c1, addr << 1, reg, I2C_MEMADD_SIZE_8BIT,
+                        (uint8_t *)data, (uint16_t)len, 100) == HAL_OK)
+    return BME280_INTF_RET_SUCCESS;
+  return -1;
+}
+
+void bme_delay_us(uint32_t period, void *intf_ptr)
+{
+  osDelay((period / 1000) + 1);   /* round up to whole ms */
 }
 
 /* USER CODE END 0 */
@@ -120,7 +148,8 @@ int main(void)
   MX_USART2_UART_Init();
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
-
+  HAL_UART_Transmit(&huart2, (uint8_t *)"UART test\r\n", 11, 100);
+  printf("\r\nBoot OK\r\n");
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -151,6 +180,16 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
+
+  if (PrintTaskHandle == NULL)
+  {
+    printf("PrintTask creation FAILED\r\n");
+  }
+  else
+  {
+    printf("PrintTask created\r\n");
+  }
+
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -372,50 +411,54 @@ void StartBlinkTask(void *argument)
 void StartPrintTask(void *argument)
 {
   /* USER CODE BEGIN StartPrintTask */
-  uint8_t bmeAddr = 0;
-  uint8_t id = 0;
-
-  printf("\r\nI2C scan starting...\r\n");
-  for (uint8_t addr = 1; addr < 128; addr++)
-  {
-    if (HAL_I2C_IsDeviceReady(&hi2c1, addr << 1, 2, 10) == HAL_OK)
-    {
-      printf("Found device at 0x%02X\r\n", addr);
-    }
-  }
-  printf("Scan done.\r\n");
-
-  if (HAL_I2C_IsDeviceReady(&hi2c1, 0x76 << 1, 2, 10) == HAL_OK)
-    bmeAddr = 0x76;
-  else if (HAL_I2C_IsDeviceReady(&hi2c1, 0x77 << 1, 2, 10) == HAL_OK)
-    bmeAddr = 0x77;
-
-  uint8_t cmd = 0x10;   /* continuous high-resolution mode */
+  struct bme280_dev dev;
+  struct bme280_settings settings;
+  struct bme280_data data;
+  int8_t rslt;
+  uint8_t cmd = 0x10;
   uint8_t buf[2];
-  HAL_I2C_Master_Transmit(&hi2c1, 0x23 << 1, &cmd, 1, 100);
-  osDelay(180);         /* first measurement takes up to 180 ms */
 
-  /* Infinite loop */
+  /* Connect Bosch's driver to our I2C functions */
+  dev.intf = BME280_I2C_INTF;
+  dev.intf_ptr = &bme_addr;
+  dev.read = bme_i2c_read;
+  dev.write = bme_i2c_write;
+  dev.delay_us = bme_delay_us;
+
+  rslt = bme280_init(&dev);
+  printf("\r\nbme280_init result: %d\r\n", rslt);
+
+  /* 1x oversampling, no filter, new reading every 1 s */
+  rslt = bme280_get_sensor_settings(&settings, &dev);
+  settings.osr_t = BME280_OVERSAMPLING_1X;
+  settings.osr_h = BME280_OVERSAMPLING_1X;
+  settings.osr_p = BME280_OVERSAMPLING_1X;
+  settings.filter = BME280_FILTER_COEFF_OFF;
+  settings.standby_time = BME280_STANDBY_TIME_1000_MS;
+  rslt = bme280_set_sensor_settings(BME280_SEL_ALL_SETTINGS, &settings, &dev);
+  rslt = bme280_set_sensor_mode(BME280_POWERMODE_NORMAL, &dev);
+  printf("bme280 setup result: %d\r\n", rslt);
+
+  /* BH1750 continuous high-resolution mode */
+  HAL_I2C_Master_Transmit(&hi2c1, 0x23 << 1, &cmd, 1, 100);
+  osDelay(180);
+
   /* Infinite loop */
   for(;;)
   {
-    if (bmeAddr == 0)
+    rslt = bme280_get_sensor_data(BME280_ALL, &data, &dev);
+    if (rslt == BME280_OK)
     {
-      printf("No BME280 found at 0x76 or 0x77\r\n");
-    }
-    else if (HAL_I2C_Mem_Read(&hi2c1, bmeAddr << 1, 0xD0,
-                              I2C_MEMADD_SIZE_8BIT, &id, 1, 100) == HAL_OK)
-    {
-      if (id == 0x60)
-        printf("Chip ID 0x60: real BME280\r\n");
-      else if (id == 0x58)
-        printf("Chip ID 0x58: BMP280 (no humidity!)\r\n");
-      else
-        printf("Chip ID 0x%02X: unknown\r\n", id);
+      int32_t t = data.temperature;                 /* 0.01 degC */
+      int32_t tFrac = t % 100;
+      uint32_t h = data.humidity * 100 / 1024;      /* 0.01 %RH */
+      if (tFrac < 0) tFrac = -tFrac;
+      printf("Temp: %ld.%02ld C   Humidity: %lu.%02lu %%\r\n",
+             t / 100, tFrac, h / 100, h % 100);
     }
     else
     {
-      printf("Chip ID read failed\r\n");
+      printf("BME280 read failed: %d\r\n", rslt);
     }
 
     if (HAL_I2C_Master_Receive(&hi2c1, 0x23 << 1, buf, 2, 100) == HAL_OK)
