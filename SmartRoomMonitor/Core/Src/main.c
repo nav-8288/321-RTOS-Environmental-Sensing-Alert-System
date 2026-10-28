@@ -25,6 +25,8 @@
 
 #include <stdio.h>
 #include "bme280.h"
+#include "ssd1306.h"
+#include "ssd1306_fonts.h"
 
 /* USER CODE END Includes */
 
@@ -411,12 +413,14 @@ void StartBlinkTask(void *argument)
 void StartPrintTask(void *argument)
 {
   /* USER CODE BEGIN StartPrintTask */
+
   struct bme280_dev dev;
   struct bme280_settings settings;
   struct bme280_data data;
   int8_t rslt;
   uint8_t cmd = 0x10;
   uint8_t buf[2];
+  char line[24];
 
   /* Connect Bosch's driver to our I2C functions */
   dev.intf = BME280_I2C_INTF;
@@ -443,6 +447,14 @@ void StartPrintTask(void *argument)
   HAL_I2C_Master_Transmit(&hi2c1, 0x23 << 1, &cmd, 1, 100);
   osDelay(180);
 
+  ssd1306_Init();
+  ssd1306_Fill(Black);
+  ssd1306_SetCursor(0, 0);
+  ssd1306_WriteString("Smart Room", Font_11x18, White);
+  ssd1306_UpdateScreen();
+
+  /* Infinite loop */
+  for(;;)
   /* Infinite loop */
   for(;;)
   {
@@ -470,6 +482,32 @@ void StartPrintTask(void *argument)
     {
       printf("BH1750 read failed\r\n");
     }
+
+    ssd1306_Fill(Black);
+    ssd1306_SetCursor(0, 0);
+    ssd1306_WriteString("Smart Room", Font_11x18, White);
+
+    if (rslt == BME280_OK)
+    {
+      int32_t t = data.temperature;
+      int32_t tFrac = t % 100;
+      uint32_t h = data.humidity * 100 / 1024;
+      if (tFrac < 0) tFrac = -tFrac;
+
+      snprintf(line, sizeof(line), "Temp: %ld.%02ld C", t / 100, tFrac);
+      ssd1306_SetCursor(0, 24);
+      ssd1306_WriteString(line, Font_7x10, White);
+
+      snprintf(line, sizeof(line), "Hum:  %lu.%02lu %%", h / 100, h % 100);
+      ssd1306_SetCursor(0, 36);
+      ssd1306_WriteString(line, Font_7x10, White);
+    }
+
+    snprintf(line, sizeof(line), "Light: %u lux", (unsigned)(((buf[0] << 8) | buf[1]) * 10 / 12));
+    ssd1306_SetCursor(0, 48);
+    ssd1306_WriteString(line, Font_7x10, White);
+
+    ssd1306_UpdateScreen();
 
     osDelay(2000);
   }
