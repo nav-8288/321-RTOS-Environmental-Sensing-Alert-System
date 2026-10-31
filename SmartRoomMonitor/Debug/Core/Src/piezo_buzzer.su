@@ -1,0 +1,2 @@
+../Core/Src/piezo_buzzer.c:7:6:piezo_active	8	static
+../Core/Src/piezo_buzzer.c:13:6:piezo_inactive	8	static

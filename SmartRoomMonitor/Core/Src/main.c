@@ -34,10 +34,23 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+typedef struct
+{
+  int32_t  temperature;  /* 0.01 degC */
+  uint32_t humidity;     /* 1/1024 %RH */
+  uint16_t lux;
+  uint16_t airRaw;       /* MQ-135, 0-4095 */
+  uint8_t  bmeOk;
+  uint8_t  lightOk;
+} SensorData_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+#define TEMP_ALERT_CENTI   2800   /* 28.00 C */
+#define AIR_ALERT_RAW      2000   /* 2000 Pa */
 
 /* USER CODE END PD */
 
@@ -59,15 +72,15 @@ UART_HandleTypeDef huart2;
 osThreadId_t BlinkTaskHandle;
 const osThreadAttr_t BlinkTask_attributes = {
   .name = "BlinkTask",
-  .stack_size = 256 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityLow,
 };
-/* Definitions for PrintTask */
-osThreadId_t PrintTaskHandle;
-const osThreadAttr_t PrintTask_attributes = {
-  .name = "PrintTask",
-  .stack_size = 512 * 4,
-  .priority = (osPriority_t) osPriorityBelowNormal,
+/* Definitions for SensorTask */
+osThreadId_t SensorTaskHandle;
+const osThreadAttr_t SensorTask_attributes = {
+  .name = "SensorTask",
+  .stack_size = 384 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
 };
 /* Definitions for AlertTask */
 osThreadId_t AlertTaskHandle;
@@ -76,7 +89,18 @@ const osThreadAttr_t AlertTask_attributes = {
   .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
+/* Definitions for DisplayTask */
+osThreadId_t DisplayTaskHandle;
+const osThreadAttr_t DisplayTask_attributes = {
+  .name = "DisplayTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityBelowNormal,
+};
 /* USER CODE BEGIN PV */
+
+osMutexId_t i2cMutex;
+osMessageQueueId_t sensorQueue;
+osSemaphoreId_t alertSem;
 
 /* USER CODE END PV */
 
@@ -88,8 +112,9 @@ static void MX_I2C1_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_ADC_Init(void);
 void StartBlinkTask(void *argument);
-void StartPrintTask(void *argument);
+void StartSensorTask(void *argument);
 void StartAlertTask(void *argument);
+void StartDisplayTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -167,8 +192,7 @@ int main(void)
   MX_TIM3_Init();
   MX_ADC_Init();
   /* USER CODE BEGIN 2 */
-  HAL_UART_Transmit(&huart2, (uint8_t *)"UART test\r\n", 11, 100);
-  printf("\r\nBoot OK\r\n");
+  HAL_ADCEx_Calibration_Start(&hadc);
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -176,10 +200,16 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
+
+  i2cMutex = osMutexNew(NULL);
+
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
   /* add semaphores, ... */
+
+  alertSem = osSemaphoreNew(1, 0, NULL);
+
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
@@ -188,28 +218,30 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
+
+  sensorQueue = osMessageQueueNew(4, sizeof(SensorData_t), NULL);
+
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
   /* creation of BlinkTask */
   BlinkTaskHandle = osThreadNew(StartBlinkTask, NULL, &BlinkTask_attributes);
 
-  /* creation of PrintTask */
-  PrintTaskHandle = osThreadNew(StartPrintTask, NULL, &PrintTask_attributes);
+  /* creation of SensorTask */
+  SensorTaskHandle = osThreadNew(StartSensorTask, NULL, &SensorTask_attributes);
 
   /* creation of AlertTask */
   AlertTaskHandle = osThreadNew(StartAlertTask, NULL, &AlertTask_attributes);
 
+  /* creation of DisplayTask */
+  DisplayTaskHandle = osThreadNew(StartDisplayTask, NULL, &DisplayTask_attributes);
+
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
 
-  if (PrintTaskHandle == NULL)
+  if (SensorTaskHandle == NULL || DisplayTaskHandle == NULL || AlertTaskHandle == NULL)
   {
-    printf("PrintTask creation FAILED\r\n");
-  }
-  else
-  {
-    printf("PrintTask created\r\n");
+    printf("Task creation FAILED\r\n");
   }
 
   /* USER CODE END RTOS_THREADS */
@@ -535,115 +567,86 @@ void StartBlinkTask(void *argument)
   /* USER CODE END 5 */
 }
 
-/* USER CODE BEGIN Header_StartPrintTask */
+/* USER CODE BEGIN Header_StartSensorTask */
 /**
-* @brief Function implementing the PrintTask thread.
+* @brief Function implementing the SensorTask thread.
 * @param argument: Not used
 * @retval None
 */
-/* USER CODE END Header_StartPrintTask */
-void StartPrintTask(void *argument)
+/* USER CODE END Header_StartSensorTask */
+void StartSensorTask(void *argument)
 {
-  /* USER CODE BEGIN StartPrintTask */
-
+  /* USER CODE BEGIN StartSensorTask */
   struct bme280_dev dev;
   struct bme280_settings settings;
   struct bme280_data data;
+  SensorData_t reading;
   int8_t rslt;
   uint8_t cmd = 0x10;
   uint8_t buf[2];
-  char line[24];
+  uint32_t nextWake;
 
-  /* Connect Bosch's driver to our I2C functions */
   dev.intf = BME280_I2C_INTF;
   dev.intf_ptr = &bme_addr;
   dev.read = bme_i2c_read;
   dev.write = bme_i2c_write;
   dev.delay_us = bme_delay_us;
 
+  /* Sensor setup uses I2C, so take the mutex */
+  osMutexAcquire(i2cMutex, osWaitForever);
   rslt = bme280_init(&dev);
-  printf("\r\nbme280_init result: %d\r\n", rslt);
-
-  /* 1x oversampling, no filter, new reading every 1 s */
-  rslt = bme280_get_sensor_settings(&settings, &dev);
+  bme280_get_sensor_settings(&settings, &dev);
   settings.osr_t = BME280_OVERSAMPLING_1X;
   settings.osr_h = BME280_OVERSAMPLING_1X;
   settings.osr_p = BME280_OVERSAMPLING_1X;
   settings.filter = BME280_FILTER_COEFF_OFF;
   settings.standby_time = BME280_STANDBY_TIME_1000_MS;
-  rslt = bme280_set_sensor_settings(BME280_SEL_ALL_SETTINGS, &settings, &dev);
-  rslt = bme280_set_sensor_mode(BME280_POWERMODE_NORMAL, &dev);
-  printf("bme280 setup result: %d\r\n", rslt);
-
-  /* BH1750 continuous high-resolution mode */
+  bme280_set_sensor_settings(BME280_SEL_ALL_SETTINGS, &settings, &dev);
+  bme280_set_sensor_mode(BME280_POWERMODE_NORMAL, &dev);
   HAL_I2C_Master_Transmit(&hi2c1, 0x23 << 1, &cmd, 1, 100);
+  osMutexRelease(i2cMutex);
+
+  printf("\r\nSensorTask started, bme280_init: %d\r\n", rslt);
   osDelay(180);
 
-  ssd1306_Init();
-  ssd1306_Fill(Black);
-  ssd1306_SetCursor(0, 0);
-  ssd1306_WriteString("Smart Room", Font_11x18, White);
-  ssd1306_UpdateScreen();
+  nextWake = osKernelGetTickCount();
 
-  /* Infinite loop */
-  for(;;)
   /* Infinite loop */
   for(;;)
   {
-    rslt = bme280_get_sensor_data(BME280_ALL, &data, &dev);
-    if (rslt == BME280_OK)
-    {
-      int32_t t = data.temperature;                 /* 0.01 degC */
-      int32_t tFrac = t % 100;
-      uint32_t h = data.humidity * 100 / 1024;      /* 0.01 %RH */
-      if (tFrac < 0) tFrac = -tFrac;
-      printf("Temp: %ld.%02ld C   Humidity: %lu.%02lu %%\r\n",
-             t / 100, tFrac, h / 100, h % 100);
-    }
+    /* I2C sensors: hold the bus only while reading */
+    osMutexAcquire(i2cMutex, osWaitForever);
+    reading.bmeOk = (bme280_get_sensor_data(BME280_ALL, &data, &dev) == BME280_OK);
+    reading.lightOk = (HAL_I2C_Master_Receive(&hi2c1, 0x23 << 1, buf, 2, 100) == HAL_OK);
+    osMutexRelease(i2cMutex);
+
+    /* MQ-135 on the ADC (not I2C, so no mutex needed) */
+    HAL_ADC_Start(&hadc);
+    if (HAL_ADC_PollForConversion(&hadc, 10) == HAL_OK)
+      reading.airRaw = (uint16_t)HAL_ADC_GetValue(&hadc);
     else
+      reading.airRaw = 0;
+    HAL_ADC_Stop(&hadc);
+
+    reading.temperature = data.temperature;
+    reading.humidity = data.humidity;
+    reading.lux = reading.lightOk ? (uint16_t)(((buf[0] << 8) | buf[1]) * 10 / 12) : 0;
+
+    /* Send the reading to DisplayTask (don't wait if the queue is full) */
+    osMessageQueuePut(sensorQueue, &reading, 0, 0);
+
+    /* Wake AlertTask if a threshold is crossed */
+    if ((reading.bmeOk && reading.temperature > TEMP_ALERT_CENTI) ||
+        reading.airRaw > AIR_ALERT_RAW)
     {
-      printf("BME280 read failed: %d\r\n", rslt);
+      osSemaphoreRelease(alertSem);
     }
 
-    if (HAL_I2C_Master_Receive(&hi2c1, 0x23 << 1, buf, 2, 100) == HAL_OK)
-    {
-      uint16_t raw = (buf[0] << 8) | buf[1];
-      printf("Light: %u lux\r\n", (unsigned)(raw * 10 / 12));
-    }
-    else
-    {
-      printf("BH1750 read failed\r\n");
-    }
-
-    ssd1306_Fill(Black);
-    ssd1306_SetCursor(0, 0);
-    ssd1306_WriteString("Smart Room", Font_11x18, White);
-
-    if (rslt == BME280_OK)
-    {
-      int32_t t = data.temperature;
-      int32_t tFrac = t % 100;
-      uint32_t h = data.humidity * 100 / 1024;
-      if (tFrac < 0) tFrac = -tFrac;
-
-      snprintf(line, sizeof(line), "Temp: %ld.%02ld C", t / 100, tFrac);
-      ssd1306_SetCursor(0, 24);
-      ssd1306_WriteString(line, Font_7x10, White);
-
-      snprintf(line, sizeof(line), "Hum:  %lu.%02lu %%", h / 100, h % 100);
-      ssd1306_SetCursor(0, 36);
-      ssd1306_WriteString(line, Font_7x10, White);
-    }
-
-    snprintf(line, sizeof(line), "Light: %u lux", (unsigned)(((buf[0] << 8) | buf[1]) * 10 / 12));
-    ssd1306_SetCursor(0, 48);
-    ssd1306_WriteString(line, Font_7x10, White);
-
-    ssd1306_UpdateScreen();
-
-    osDelay(2000);
+    /* Periodic: run exactly every 1000 ms */
+    nextWake += 1000;
+    osDelayUntil(nextWake);
   }
-  /* USER CODE END StartPrintTask */
+  /* USER CODE END StartSensorTask */
 }
 
 /* USER CODE BEGIN Header_StartAlertTask */
@@ -659,13 +662,90 @@ void StartAlertTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
-	  piezo_active(); /*activate buzzer for 250 ms */
-	  osDelay(250);
+    /* Block until SensorTask signals a threshold was crossed */
+    osSemaphoreAcquire(alertSem, osWaitForever);
 
-	  piezo_inactive(); /*deactivate buzzer for 500 ms */
-	  osDelay(500);
+    /* Three short beeps */
+    for (int i = 0; i < 3; i++)
+    {
+      piezo_active();
+      osDelay(150);
+      piezo_inactive();
+      osDelay(150);
+    }
   }
   /* USER CODE END StartAlertTask */
+}
+/* USER CODE BEGIN Header_StartDisplayTask */
+/**
+* @brief Function implementing the DisplayTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartDisplayTask */
+void StartDisplayTask(void *argument)
+{
+  /* USER CODE BEGIN StartDisplayTask */
+  SensorData_t r;
+  char line[32];
+
+  osMutexAcquire(i2cMutex, osWaitForever);
+  ssd1306_Init();
+  ssd1306_Fill(Black);
+  ssd1306_SetCursor(0, 0);
+  ssd1306_WriteString("Smart Room", Font_11x18, White);
+  ssd1306_UpdateScreen();
+  osMutexRelease(i2cMutex);
+
+  /* Infinite loop */
+  for(;;)
+  {
+    /* Sleep until SensorTask sends a reading */
+    if (osMessageQueueGet(sensorQueue, &r, NULL, osWaitForever) != osOK)
+      continue;
+
+    ssd1306_Fill(Black);
+    ssd1306_SetCursor(0, 0);
+    ssd1306_WriteString("Smart Room", Font_11x18, White);
+
+    if (r.bmeOk)
+    {
+      int32_t tFrac = r.temperature % 100;
+      uint32_t h = r.humidity * 100 / 1024;
+      if (tFrac < 0) tFrac = -tFrac;
+
+      printf("Temp: %ld.%02ld C  Hum: %lu.%02lu %%  ",
+             r.temperature / 100, tFrac, h / 100, h % 100);
+
+      snprintf(line, sizeof(line), "Temp: %ld.%02ld C", r.temperature / 100, tFrac);
+      ssd1306_SetCursor(0, 22);
+      ssd1306_WriteString(line, Font_7x10, White);
+
+      snprintf(line, sizeof(line), "Hum:  %lu.%02lu %%", h / 100, h % 100);
+      ssd1306_SetCursor(0, 32);
+      ssd1306_WriteString(line, Font_7x10, White);
+    }
+    else
+    {
+      printf("BME280 read failed  ");
+    }
+
+    printf("Light: %u lux  Air: %u\r\n", r.lux, r.airRaw);
+
+    snprintf(line, sizeof(line), "Light: %u lux", r.lux);
+    ssd1306_SetCursor(0, 42);
+    ssd1306_WriteString(line, Font_7x10, White);
+
+    snprintf(line, sizeof(line), "Air:   %u", r.airRaw);
+    ssd1306_SetCursor(0, 52);
+    ssd1306_WriteString(line, Font_7x10, White);
+
+    /* Only the screen update uses I2C */
+    osMutexAcquire(i2cMutex, osWaitForever);
+    ssd1306_UpdateScreen();
+    osMutexRelease(i2cMutex);
+  }
+  /* USER CODE END StartDisplayTask */
 }
 
 /**

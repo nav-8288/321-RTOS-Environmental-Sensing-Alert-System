@@ -64,8 +64,8 @@ all: main-build
 main-build: SmartRoomMonitor.elf secondary-outputs
 
 # Tool invocations
-SmartRoomMonitor.elf SmartRoomMonitor.map: $(OBJS) $(USER_OBJS) C:\Users\rifat\CSE321\SmartRoomMonitor\STM32F072RBTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "SmartRoomMonitor.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m0 -T"C:\Users\rifat\CSE321\SmartRoomMonitor\STM32F072RBTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="SmartRoomMonitor.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+SmartRoomMonitor.elf SmartRoomMonitor.map: $(OBJS) $(USER_OBJS) C:\Users\rifat\CSE321\321-RTOS-Environmental-Sensing-Alert-System\SmartRoomMonitor\STM32F072RBTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "SmartRoomMonitor.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m0 -T"C:\Users\rifat\CSE321\321-RTOS-Environmental-Sensing-Alert-System\SmartRoomMonitor\STM32F072RBTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="SmartRoomMonitor.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 
