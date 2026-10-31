@@ -593,7 +593,6 @@ void StartSensorTask(void *argument)
   dev.write = bme_i2c_write;
   dev.delay_us = bme_delay_us;
 
-  /* Sensor setup uses I2C, so take the mutex */
   osMutexAcquire(i2cMutex, osWaitForever);
   rslt = bme280_init(&dev);
   bme280_get_sensor_settings(&settings, &dev);
@@ -615,13 +614,13 @@ void StartSensorTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
-    /* I2C sensors: hold the bus only while reading */
+
     osMutexAcquire(i2cMutex, osWaitForever);
     reading.bmeOk = (bme280_get_sensor_data(BME280_ALL, &data, &dev) == BME280_OK);
     reading.lightOk = (HAL_I2C_Master_Receive(&hi2c1, 0x23 << 1, buf, 2, 100) == HAL_OK);
     osMutexRelease(i2cMutex);
 
-    /* MQ-135 on the ADC (not I2C, so no mutex needed) */
+
     HAL_ADC_Start(&hadc);
     if (HAL_ADC_PollForConversion(&hadc, 10) == HAL_OK)
       reading.airRaw = (uint16_t)HAL_ADC_GetValue(&hadc);
@@ -633,17 +632,14 @@ void StartSensorTask(void *argument)
     reading.humidity = data.humidity;
     reading.lux = reading.lightOk ? (uint16_t)(((buf[0] << 8) | buf[1]) * 10 / 12) : 0;
 
-    /* Send the reading to DisplayTask (don't wait if the queue is full) */
     osMessageQueuePut(sensorQueue, &reading, 0, 0);
 
-    /* Wake AlertTask if a threshold is crossed */
     if ((reading.bmeOk && reading.temperature > TEMP_ALERT_CENTI) ||
         reading.airRaw > AIR_ALERT_RAW)
     {
       osSemaphoreRelease(alertSem);
     }
 
-    /* Periodic: run exactly every 1000 ms */
     nextWake += 1000;
     osDelayUntil(nextWake);
   }
@@ -663,7 +659,7 @@ void StartAlertTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
-    /* Block until SensorTask signals a threshold was crossed */
+
     osSemaphoreAcquire(alertSem, osWaitForever);
 
     /* Three short beeps */
@@ -701,7 +697,6 @@ void StartDisplayTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
-    /* Sleep until SensorTask sends a reading */
     if (osMessageQueueGet(sensorQueue, &r, NULL, osWaitForever) != osOK)
       continue;
 
@@ -741,7 +736,6 @@ void StartDisplayTask(void *argument)
     ssd1306_SetCursor(0, 52);
     ssd1306_WriteString(line, Font_7x10, White);
 
-    /* Only the screen update uses I2C */
     osMutexAcquire(i2cMutex, osWaitForever);
     ssd1306_UpdateScreen();
     osMutexRelease(i2cMutex);

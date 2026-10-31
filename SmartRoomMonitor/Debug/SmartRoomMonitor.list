@@ -5003,7 +5003,6 @@ void StartSensorTask(void *argument)
  8001dae:	4a77      	ldr	r2, [pc, #476]	@ (8001f8c <StartSensorTask+0x20c>)
  8001db0:	615a      	str	r2, [r3, #20]
 
-  /* Sensor setup uses I2C, so take the mutex */
   osMutexAcquire(i2cMutex, osWaitForever);
  8001db2:	4b77      	ldr	r3, [pc, #476]	@ (8001f90 <StartSensorTask+0x210>)
  8001db4:	681b      	ldr	r3, [r3, #0]
@@ -5095,7 +5094,7 @@ void StartSensorTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
-    /* I2C sensors: hold the bus only while reading */
+
     osMutexAcquire(i2cMutex, osWaitForever);
  8001e52:	4b4f      	ldr	r3, [pc, #316]	@ (8001f90 <StartSensorTask+0x210>)
  8001e54:	681b      	ldr	r3, [r3, #0]
@@ -5142,7 +5141,7 @@ void StartSensorTask(void *argument)
  8001ea6:	0018      	movs	r0, r3
  8001ea8:	f005 fd14 	bl	80078d4 <osMutexRelease>
 
-    /* MQ-135 on the ADC (not I2C, so no mutex needed) */
+
     HAL_ADC_Start(&hadc);
  8001eac:	4b3b      	ldr	r3, [pc, #236]	@ (8001f9c <StartSensorTask+0x21c>)
  8001eae:	0018      	movs	r0, r3
@@ -5213,7 +5212,6 @@ void StartSensorTask(void *argument)
  8001f28:	187b      	adds	r3, r7, r1
  8001f2a:	811a      	strh	r2, [r3, #8]
 
-    /* Send the reading to DisplayTask (don't wait if the queue is full) */
     osMessageQueuePut(sensorQueue, &reading, 0, 0);
  8001f2c:	4b1c      	ldr	r3, [pc, #112]	@ (8001fa0 <StartSensorTask+0x220>)
  8001f2e:	6818      	ldr	r0, [r3, #0]
@@ -5223,7 +5221,6 @@ void StartSensorTask(void *argument)
  8001f36:	2200      	movs	r2, #0
  8001f38:	f005 feea 	bl	8007d10 <osMessageQueuePut>
 
-    /* Wake AlertTask if a threshold is crossed */
     if ((reading.bmeOk && reading.temperature > TEMP_ALERT_CENTI) ||
  8001f3c:	0021      	movs	r1, r4
  8001f3e:	187b      	adds	r3, r7, r1
@@ -5253,7 +5250,6 @@ void StartSensorTask(void *argument)
  8001f66:	f005 fdff 	bl	8007b68 <osSemaphoreRelease>
     }
 
-    /* Periodic: run exactly every 1000 ms */
     nextWake += 1000;
  8001f6a:	6f7b      	ldr	r3, [r7, #116]	@ 0x74
  8001f6c:	22fa      	movs	r2, #250	@ 0xfa
@@ -5293,7 +5289,7 @@ void StartAlertTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
-    /* Block until SensorTask signals a threshold was crossed */
+
     osSemaphoreAcquire(alertSem, osWaitForever);
  8001fb0:	4b0d      	ldr	r3, [pc, #52]	@ (8001fe8 <StartAlertTask+0x40>)
  8001fb2:	681b      	ldr	r3, [r3, #0]
@@ -5382,7 +5378,6 @@ void StartDisplayTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
-    /* Sleep until SensorTask sends a reading */
     if (osMessageQueueGet(sensorQueue, &r, NULL, osWaitForever) != osOK)
  8002036:	4b70      	ldr	r3, [pc, #448]	@ (80021f8 <StartDisplayTask+0x20c>)
  8002038:	6818      	ldr	r0, [r3, #0]
@@ -5598,7 +5593,6 @@ void StartDisplayTask(void *argument)
  80021c2:	689b      	ldr	r3, [r3, #8]
  80021c4:	f000 fa54 	bl	8002670 <ssd1306_WriteString>
 
-    /* Only the screen update uses I2C */
     osMutexAcquire(i2cMutex, osWaitForever);
  80021c8:	4b08      	ldr	r3, [pc, #32]	@ (80021ec <StartDisplayTask+0x200>)
  80021ca:	681b      	ldr	r3, [r3, #0]

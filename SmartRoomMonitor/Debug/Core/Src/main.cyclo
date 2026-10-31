@@ -11,7 +11,7 @@
 ../Core/Src/main.c:508:13:MX_GPIO_Init	1
 ../Core/Src/main.c:559:6:StartBlinkTask	1
 ../Core/Src/main.c:578:6:StartSensorTask	6
-../Core/Src/main.c:660:6:StartAlertTask	2
-../Core/Src/main.c:687:6:StartDisplayTask	4
-../Core/Src/main.c:760:6:HAL_TIM_PeriodElapsedCallback	2
-../Core/Src/main.c:778:6:Error_Handler	1
+../Core/Src/main.c:656:6:StartAlertTask	2
+../Core/Src/main.c:683:6:StartDisplayTask	4
+../Core/Src/main.c:754:6:HAL_TIM_PeriodElapsedCallback	2
+../Core/Src/main.c:772:6:Error_Handler	1
