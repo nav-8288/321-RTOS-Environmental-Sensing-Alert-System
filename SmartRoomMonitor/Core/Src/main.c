@@ -193,6 +193,7 @@ int main(void)
   MX_ADC_Init();
   /* USER CODE BEGIN 2 */
   HAL_ADCEx_Calibration_Start(&hadc);
+
   /* USER CODE END 2 */
 
   /* Init scheduler */
