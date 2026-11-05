@@ -111,6 +111,7 @@ osMutexId_t i2cMutex;
 osMessageQueueId_t sensorQueue;
 osSemaphoreId_t alertSem;
 osSemaphoreId_t motionSem;
+volatile uint32_t lastMotionTick = 0;
 
 /* USER CODE END PV */
 
@@ -864,14 +865,26 @@ void StartMotionTask(void *argument)
 {
   /* USER CODE BEGIN StartMotionTask */
   uint32_t count = 0;
+  uint32_t start;
 
-  /* Infinite loop */
   for(;;)
   {
-    /* Sleep until the PIR interrupt releases the semaphore */
     osSemaphoreAcquire(motionSem, osWaitForever);
+
     count++;
-    printf("Motion detected (#%lu) at %lu ms\r\n", count, osKernelGetTickCount());
+    start = osKernelGetTickCount();
+    lastMotionTick = start;
+    printf("Motion started (#%lu)\r\n", count);
+
+    while (readPIR() == 1)
+    {
+      lastMotionTick = osKernelGetTickCount();
+      osDelay(100);
+    }
+
+    printf("Motion ended after %lu ms\r\n", osKernelGetTickCount() - start);
+
+    osSemaphoreAcquire(motionSem, 0);
   }
   /* USER CODE END StartMotionTask */
 }

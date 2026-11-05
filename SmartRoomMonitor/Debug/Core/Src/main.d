@@ -41,7 +41,7 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  ../Middlewares/Third_Party/FreeRTOS/Source/include/mpu_wrappers.h \
  ../Core/Inc/bme280.h ../Core/Inc/bme280_defs.h ../Core/Inc/ssd1306.h \
  ../Core/Inc/ssd1306_conf.h ../Core/Inc/ssd1306_fonts.h \
- ../Core/Inc/ssd1306.h ../Core/Inc/piezo_buzzer.h
+ ../Core/Inc/ssd1306.h ../Core/Inc/piezo_buzzer.h ../Core/Inc/pir.h
 ../Core/Inc/main.h:
 ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal.h:
 ../Core/Inc/stm32f0xx_hal_conf.h:
@@ -90,3 +90,4 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../Core/Inc/ssd1306_fonts.h:
 ../Core/Inc/ssd1306.h:
 ../Core/Inc/piezo_buzzer.h:
+../Core/Inc/pir.h:
