@@ -28,6 +28,7 @@
 #include "ssd1306.h"
 #include "ssd1306_fonts.h"
 #include "piezo_buzzer.h"
+#include "pir.h"
 
 /* USER CODE END Includes */
 
@@ -42,6 +43,7 @@ typedef struct
   uint16_t airRaw;       /* MQ-135, 0-4095 */
   uint8_t  bmeOk;
   uint8_t  lightOk;
+  uint8_t  motion;
 } SensorData_t;
 
 /* USER CODE END PTD */
@@ -728,6 +730,7 @@ void StartSensorTask(void *argument)
     reading.temperature = data.temperature;
     reading.humidity = data.humidity;
     reading.lux = reading.lightOk ? (uint16_t)(((buf[0] << 8) | buf[1]) * 10 / 12) : 0;
+    reading.motion = readPIR(); /*Read the data from PIR motion sensor (0 = NOT DETECTED / 1 = DETECTED */
 
     /* Send the reading to DisplayTask (don't wait if the queue is full) */
     osMessageQueuePut(sensorQueue, &reading, 0, 0);
@@ -803,7 +806,13 @@ void StartDisplayTask(void *argument)
 
     ssd1306_Fill(Black);
     ssd1306_SetCursor(0, 0);
-    ssd1306_WriteString("Smart Room", Font_11x18, White);
+    if(r.motion == 0){ /*if no motion detected */
+        ssd1306_WriteString("NO Motion", Font_7x10, White);
+
+    }else{ /*if detected */
+        ssd1306_WriteString("Motion Detected", Font_7x10, White);
+
+    }
 
     if (r.bmeOk)
     {
