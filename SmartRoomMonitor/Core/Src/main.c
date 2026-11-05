@@ -35,6 +35,14 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+typedef enum
+{
+  STATE_NORMAL = 0,
+  STATE_WARNING,
+  STATE_ALERT,
+  STATE_SLEEP
+} SystemState_t;
+
 typedef struct
 {
   int32_t  temperature;  /* 0.01 degC */
@@ -43,7 +51,8 @@ typedef struct
   uint16_t airRaw;       /* MQ-135, 0-4095 */
   uint8_t  bmeOk;
   uint8_t  lightOk;
-  uint8_t  motion;
+  uint8_t  motion;       /* 1 = PIR currently detects motion */
+  uint8_t  state;        /* SystemState_t at the time of this reading */
 } SensorData_t;
 
 /* USER CODE END PTD */
@@ -53,6 +62,15 @@ typedef struct
 
 #define TEMP_ALERT_CENTI   2800   /* 28.00 C */
 #define AIR_ALERT_RAW      2000   /* 2000 Pa */
+#define TEMP_WARN_CENTI    2600   /* 26.00 C */
+#define AIR_WARN_RAW       1500   /* MQ-135 ADC value, tune after testing */
+#define AIR_ALERT_RAW      2000
+#define SLEEP_TIMEOUT_MS   (5 * 60 * 1000)
+#define BUTTON_DEBOUNCE_MS 200
+#define NUM_SCREENS        2
+
+#define LED_ON   GPIO_PIN_RESET
+#define LED_OFF  GPIO_PIN_SET
 
 /* USER CODE END PD */
 
@@ -112,6 +130,9 @@ osMessageQueueId_t sensorQueue;
 osSemaphoreId_t alertSem;
 osSemaphoreId_t motionSem;
 volatile uint32_t lastMotionTick = 0;
+volatile SystemState_t sysState = STATE_NORMAL;
+volatile uint8_t screenIndex = 0;
+volatile uint8_t alarmSilenced = 0;
 
 /* USER CODE END PV */
 
@@ -219,6 +240,45 @@ static int8_t bme_setup(struct bme280_dev *dev)
   return bme280_set_sensor_mode(BME280_POWERMODE_NORMAL, dev);
 }
 
+static const char *const stateName[] = { "NORMAL", "WARNING", "ALERT", "SLEEP" };
+
+/* Turns each color of the RGB LED on (1) or off (0) */
+static void set_led(uint8_t r, uint8_t g, uint8_t b)
+{
+  HAL_GPIO_WritePin(Led_R_GPIO_Port, Led_R_Pin, r ? LED_ON : LED_OFF);
+  HAL_GPIO_WritePin(Led_G_GPIO_Port, Led_G_Pin, g ? LED_ON : LED_OFF);
+  HAL_GPIO_WritePin(Led_B_GPIO_Port, Led_B_Pin, b ? LED_ON : LED_OFF);
+}
+
+/* Sets the LED color and fan for a state */
+static void apply_outputs(SystemState_t s)
+{
+  switch (s)
+  {
+    case STATE_NORMAL:  set_led(0, 1, 0); break;   /* green  */
+    case STATE_WARNING: set_led(1, 1, 0); break;   /* yellow */
+    case STATE_ALERT:   set_led(1, 0, 0); break;   /* red    */
+    default:            set_led(0, 0, 0); break;   /* sleep: off */
+  }
+
+}
+
+/* Picks the next state from the current state and a new reading */
+static SystemState_t next_state(SystemState_t cur, const SensorData_t *r)
+{
+  uint8_t alert = (r->bmeOk && r->temperature > TEMP_ALERT_CENTI) ||
+                  r->airRaw > AIR_ALERT_RAW;
+  uint8_t warn  = (r->bmeOk && r->temperature > TEMP_WARN_CENTI) ||
+                  r->airRaw > AIR_WARN_RAW;
+
+  if (alert) return STATE_ALERT;
+  /* Hysteresis: once in ALERT, stay there until readings drop below the
+     WARNING level, so the fan and buzzer don't flicker on and off */
+  if (cur == STATE_ALERT && warn) return STATE_ALERT;
+  if (warn) return STATE_WARNING;
+  return STATE_NORMAL;
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -255,6 +315,7 @@ int main(void)
   MX_TIM3_Init();
   MX_ADC_Init();
   /* USER CODE BEGIN 2 */
+
   HAL_ADCEx_Calibration_Start(&hadc);
 
   /* USER CODE END 2 */
@@ -656,12 +717,28 @@ static void MX_GPIO_Init(void)
 /* Runs inside the EXTI interrupt. Keep it short: just signal the task. */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-  if (GPIO_Pin == PIR_Pin && motionSem != NULL)
+  if (GPIO_Pin == PIR_Pin)
   {
-    osSemaphoreRelease(motionSem);
+    if (motionSem != NULL)
+      osSemaphoreRelease(motionSem);
+  }
+  else if (GPIO_Pin == BUTTON_Pin || GPIO_Pin == B1_Pin)
+  {
+    /* Debounce: ignore bounces within 200 ms of the last press */
+    static uint32_t lastPress = 0;
+    uint32_t now = HAL_GetTick();
+    if (now - lastPress < BUTTON_DEBOUNCE_MS)
+      return;
+    lastPress = now;
+
+    lastMotionTick = osKernelGetTickCount();   /* any press also wakes from Sleep */
+
+    if (sysState == STATE_ALERT)
+      alarmSilenced = 1;                        /* silence the buzzer */
+    else
+      screenIndex = (screenIndex + 1) % NUM_SCREENS;   /* next screen */
   }
 }
-
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartBlinkTask */
@@ -695,7 +772,7 @@ void StartSensorTask(void *argument)
   /* USER CODE BEGIN StartSensorTask */
   struct bme280_dev dev;
   struct bme280_data data;
-  SensorData_t reading;
+  SensorData_t reading = {0};
   int8_t rslt;
   uint8_t cmd = 0x10;          /* BH1750 continuous high-resolution mode */
   uint8_t buf[2];
@@ -716,6 +793,8 @@ void StartSensorTask(void *argument)
 
   printf("\r\nSensorTask started, bme280 setup: %d\r\n", rslt);
   osDelay(180);
+
+  apply_outputs(sysState);
 
   nextWake = osKernelGetTickCount();
 
@@ -762,12 +841,31 @@ void StartSensorTask(void *argument)
     reading.lux = reading.lightOk ? (uint16_t)(((buf[0] << 8) | buf[1]) * 10 / 12) : 0;
     reading.motion = readPIR(); /*Read the data from PIR motion sensor (0 = NOT DETECTED / 1 = DETECTED */
 
-    /* Send the reading to DisplayTask (don't wait if the queue is full) */
+    SystemState_t next = next_state(sysState, &reading);
+
+    /* Sleep when nothing is wrong and nobody has moved for a while */
+    if (next == STATE_NORMAL &&
+        (osKernelGetTickCount() - lastMotionTick) > SLEEP_TIMEOUT_MS)
+    {
+      next = STATE_SLEEP;
+    }
+
+    if (next != sysState)
+    {
+      printf("State: %s -> %s\r\n", stateName[sysState], stateName[next]);
+      sysState = next;
+      apply_outputs(sysState);
+    }
+
+    if (sysState != STATE_ALERT)
+      alarmSilenced = 0;   /* re-arm the alarm once the alert clears */
+
+    /* Send the reading (with the current state) to DisplayTask */
+    reading.state = sysState;
     osMessageQueuePut(sensorQueue, &reading, 0, 0);
 
-    /* Wake AlertTask if a threshold is crossed */
-    if ((reading.bmeOk && reading.temperature > TEMP_ALERT_CENTI) ||
-        reading.airRaw > AIR_ALERT_RAW)
+    /* Wake AlertTask to beep, unless the user silenced it */
+    if (sysState == STATE_ALERT && !alarmSilenced)
     {
       osSemaphoreRelease(alertSem);
     }
@@ -819,6 +917,7 @@ void StartDisplayTask(void *argument)
   /* USER CODE BEGIN StartDisplayTask */
   SensorData_t r;
   char line[32];
+  uint8_t displayOn = 1;
 
   osMutexAcquire(i2cMutex, osWaitForever);
   ssd1306_Init();
@@ -831,51 +930,100 @@ void StartDisplayTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
+    /* Sleep until SensorTask sends a reading */
     if (osMessageQueueGet(sensorQueue, &r, NULL, osWaitForever) != osOK)
       continue;
 
-    ssd1306_Fill(Black);
-    ssd1306_SetCursor(0, 0);
-    if(r.motion == 0){ /*if no motion detected */
-        ssd1306_WriteString("NO Motion", Font_7x10, White);
-
-    }else{ /*if detected */
-        ssd1306_WriteString("Motion Detected", Font_7x10, White);
-
+    /* ---- Sleep: turn the screen off and skip drawing ---- */
+    if (r.state == STATE_SLEEP)
+    {
+      if (displayOn)
+      {
+        osMutexAcquire(i2cMutex, osWaitForever);
+        ssd1306_SetDisplayOn(0);
+        osMutexRelease(i2cMutex);
+        displayOn = 0;
+      }
+      continue;
+    }
+    if (!displayOn)
+    {
+      osMutexAcquire(i2cMutex, osWaitForever);
+      ssd1306_SetDisplayOn(1);
+      osMutexRelease(i2cMutex);
+      displayOn = 1;
     }
 
+    /* ---- Serial output (every reading) ---- */
+    int32_t  tFrac = r.temperature % 100;
+    uint32_t h = r.humidity * 100 / 1024;
+    if (tFrac < 0) tFrac = -tFrac;
+
     if (r.bmeOk)
+      printf("[%s] Temp: %ld.%02ld C  Hum: %lu.%02lu %%  ",
+             stateName[r.state], r.temperature / 100, tFrac, h / 100, h % 100);
+    else
+
+    	printf("[%s] BME280 read failed  ", stateName[r.state]);
+    	printf("Light: %u lux  Air: %u  PIR: %u\r\n", r.lux, r.airRaw, r.motion);
+
+    /* ---- Draw the selected screen into the RAM buffer ---- */
+        ssd1306_Fill(Black);
+        ssd1306_SetCursor(0, 0);
+        if (screenIndex == 0)
+        {
+          /* Main screen: title shows the PIR state */
+          ssd1306_WriteString(r.motion ? "Motion!" : "No Motion", Font_11x18, White);
+        }
+        else
+        {
+          /* Status screen keeps the project name */
+          ssd1306_WriteString("Smart Room", Font_11x18, White);
+        }
+
+    if (screenIndex == 0)
     {
-      int32_t tFrac = r.temperature % 100;
-      uint32_t h = r.humidity * 100 / 1024;
-      if (tFrac < 0) tFrac = -tFrac;
+      /* Screen 1: sensor readings */
+      if (r.bmeOk)
+      {
+        snprintf(line, sizeof(line), "Temp: %ld.%02ld C", r.temperature / 100, tFrac);
+        ssd1306_SetCursor(0, 22);
+        ssd1306_WriteString(line, Font_7x10, White);
 
-      printf("Temp: %ld.%02ld C  Hum: %lu.%02lu %%  ",
-             r.temperature / 100, tFrac, h / 100, h % 100);
-
-      snprintf(line, sizeof(line), "Temp: %ld.%02ld C", r.temperature / 100, tFrac);
-      ssd1306_SetCursor(0, 22);
+        snprintf(line, sizeof(line), "Hum:  %lu.%02lu %%", h / 100, h % 100);
+        ssd1306_SetCursor(0, 32);
+        ssd1306_WriteString(line, Font_7x10, White);
+      }
+      snprintf(line, sizeof(line), "Light: %u lux", r.lux);
+      ssd1306_SetCursor(0, 42);
       ssd1306_WriteString(line, Font_7x10, White);
 
-      snprintf(line, sizeof(line), "Hum:  %lu.%02lu %%", h / 100, h % 100);
-      ssd1306_SetCursor(0, 32);
+      snprintf(line, sizeof(line), "Air:   %u", r.airRaw);
+      ssd1306_SetCursor(0, 52);
       ssd1306_WriteString(line, Font_7x10, White);
     }
     else
     {
-      printf("BME280 read failed  ");
+      /* Screen 2: system status */
+      snprintf(line, sizeof(line), "State: %s", stateName[r.state]);
+      ssd1306_SetCursor(0, 22);
+      ssd1306_WriteString(line, Font_7x10, White);
+
+      snprintf(line, sizeof(line), "Fan:   %s", (r.state == STATE_ALERT) ? "ON" : "OFF");
+      ssd1306_SetCursor(0, 32);
+      ssd1306_WriteString(line, Font_7x10, White);
+
+      snprintf(line, sizeof(line), "Alarm: %s", alarmSilenced ? "silenced" : "armed");
+      ssd1306_SetCursor(0, 42);
+      ssd1306_WriteString(line, Font_7x10, White);
+
+      snprintf(line, sizeof(line), "Motion: %lus ago",
+               (osKernelGetTickCount() - lastMotionTick) / 1000);
+      ssd1306_SetCursor(0, 52);
+      ssd1306_WriteString(line, Font_7x10, White);
     }
 
-    printf("Light: %u lux  Air: %u\r\n", r.lux, r.airRaw);
-
-    snprintf(line, sizeof(line), "Light: %u lux", r.lux);
-    ssd1306_SetCursor(0, 42);
-    ssd1306_WriteString(line, Font_7x10, White);
-
-    snprintf(line, sizeof(line), "Air:   %u", r.airRaw);
-    ssd1306_SetCursor(0, 52);
-    ssd1306_WriteString(line, Font_7x10, White);
-
+    /* Only the screen update uses I2C, so only lock around it */
     osMutexAcquire(i2cMutex, osWaitForever);
     ssd1306_UpdateScreen();
     osMutexRelease(i2cMutex);
