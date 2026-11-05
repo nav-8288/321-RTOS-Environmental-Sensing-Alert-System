@@ -96,11 +96,19 @@ const osThreadAttr_t DisplayTask_attributes = {
   .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityBelowNormal,
 };
+/* Definitions for MotionTask */
+osThreadId_t MotionTaskHandle;
+const osThreadAttr_t MotionTask_attributes = {
+  .name = "MotionTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
 /* USER CODE BEGIN PV */
 
 osMutexId_t i2cMutex;
 osMessageQueueId_t sensorQueue;
 osSemaphoreId_t alertSem;
+osSemaphoreId_t motionSem;
 
 /* USER CODE END PV */
 
@@ -115,6 +123,7 @@ void StartBlinkTask(void *argument);
 void StartSensorTask(void *argument);
 void StartAlertTask(void *argument);
 void StartDisplayTask(void *argument);
+void StartMotionTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -154,6 +163,57 @@ BME280_INTF_RET_TYPE bme_i2c_write(uint8_t reg, const uint8_t *data,
 void bme_delay_us(uint32_t period, void *intf_ptr)
 {
   osDelay((period / 1000) + 1);   /* round up to whole ms */
+}
+
+/* Frees a stuck I2C bus and restarts the I2C1 peripheral */
+static void i2c_bus_recover(void)
+{
+  GPIO_InitTypeDef g = {0};
+
+  HAL_I2C_DeInit(&hi2c1);
+
+  /* Temporarily drive SCL (PB8) and SDA (PB9) as plain open-drain pins */
+  g.Pin = GPIO_PIN_8 | GPIO_PIN_9;
+  g.Mode = GPIO_MODE_OUTPUT_OD;
+  g.Pull = GPIO_NOPULL;
+  g.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOB, &g);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);   /* release SDA */
+
+  /* Pulse SCL 9 times so any device holding SDA low finishes its byte */
+  for (int i = 0; i < 9; i++)
+  {
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
+    for (volatile int d = 0; d < 100; d++);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
+    for (volatile int d = 0; d < 100; d++);
+  }
+
+  /* Send a STOP condition: SDA goes low -> high while SCL is high */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);
+  for (volatile int d = 0; d < 100; d++);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);
+
+  MX_I2C1_Init();   /* switch the pins back to I2C and restart the peripheral */
+}
+
+/* Initializes the BME280 and starts continuous (normal mode) measurements */
+static int8_t bme_setup(struct bme280_dev *dev)
+{
+  struct bme280_settings s;
+  int8_t r = bme280_init(dev);
+  if (r != BME280_OK) return r;
+
+  bme280_get_sensor_settings(&s, dev);
+  s.osr_t = BME280_OVERSAMPLING_1X;
+  s.osr_h = BME280_OVERSAMPLING_1X;
+  s.osr_p = BME280_OVERSAMPLING_1X;
+  s.filter = BME280_FILTER_COEFF_OFF;
+  s.standby_time = BME280_STANDBY_TIME_1000_MS;
+
+  r = bme280_set_sensor_settings(BME280_SEL_ALL_SETTINGS, &s, dev);
+  if (r != BME280_OK) return r;
+  return bme280_set_sensor_mode(BME280_POWERMODE_NORMAL, dev);
 }
 
 /* USER CODE END 0 */
@@ -210,6 +270,7 @@ int main(void)
   /* add semaphores, ... */
 
   alertSem = osSemaphoreNew(1, 0, NULL);
+  motionSem = osSemaphoreNew(1, 0, NULL);
 
   /* USER CODE END RTOS_SEMAPHORES */
 
@@ -237,10 +298,19 @@ int main(void)
   /* creation of DisplayTask */
   DisplayTaskHandle = osThreadNew(StartDisplayTask, NULL, &DisplayTask_attributes);
 
+  /* creation of MotionTask */
+  MotionTaskHandle = osThreadNew(StartMotionTask, NULL, &MotionTask_attributes);
+
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
 
   if (SensorTaskHandle == NULL || DisplayTaskHandle == NULL || AlertTaskHandle == NULL)
+  {
+    printf("Task creation FAILED\r\n");
+  }
+
+  if (SensorTaskHandle == NULL || DisplayTaskHandle == NULL ||
+      AlertTaskHandle == NULL || MotionTaskHandle == NULL)
   {
     printf("Task creation FAILED\r\n");
   }
@@ -527,11 +597,11 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PA1 */
-  GPIO_InitStruct.Pin = GPIO_PIN_1;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  /*Configure GPIO pin : PIR_Pin */
+  GPIO_InitStruct.Pin = PIR_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(PIR_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : LD2_Pin */
   GPIO_InitStruct.Pin = LD2_Pin;
@@ -540,12 +610,25 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
 
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI0_1_IRQn, 3, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_1_IRQn);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+
+/* Runs inside the EXTI interrupt. Keep it short: just signal the task. */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == PIR_Pin && motionSem != NULL)
+  {
+    osSemaphoreRelease(motionSem);
+  }
+}
 
 /* USER CODE END 4 */
 
@@ -579,12 +662,12 @@ void StartSensorTask(void *argument)
 {
   /* USER CODE BEGIN StartSensorTask */
   struct bme280_dev dev;
-  struct bme280_settings settings;
   struct bme280_data data;
   SensorData_t reading;
   int8_t rslt;
-  uint8_t cmd = 0x10;
+  uint8_t cmd = 0x10;          /* BH1750 continuous high-resolution mode */
   uint8_t buf[2];
+  uint8_t mode;                /* NEW: BME280 power mode read back each cycle */
   uint32_t nextWake;
 
   dev.intf = BME280_I2C_INTF;
@@ -593,20 +676,13 @@ void StartSensorTask(void *argument)
   dev.write = bme_i2c_write;
   dev.delay_us = bme_delay_us;
 
+  /* Sensor setup uses I2C, so take the mutex */
   osMutexAcquire(i2cMutex, osWaitForever);
-  rslt = bme280_init(&dev);
-  bme280_get_sensor_settings(&settings, &dev);
-  settings.osr_t = BME280_OVERSAMPLING_1X;
-  settings.osr_h = BME280_OVERSAMPLING_1X;
-  settings.osr_p = BME280_OVERSAMPLING_1X;
-  settings.filter = BME280_FILTER_COEFF_OFF;
-  settings.standby_time = BME280_STANDBY_TIME_1000_MS;
-  bme280_set_sensor_settings(BME280_SEL_ALL_SETTINGS, &settings, &dev);
-  bme280_set_sensor_mode(BME280_POWERMODE_NORMAL, &dev);
+  rslt = bme_setup(&dev);      /* NEW: all BME280 setup is now in one helper */
   HAL_I2C_Master_Transmit(&hi2c1, 0x23 << 1, &cmd, 1, 100);
   osMutexRelease(i2cMutex);
 
-  printf("\r\nSensorTask started, bme280_init: %d\r\n", rslt);
+  printf("\r\nSensorTask started, bme280 setup: %d\r\n", rslt);
   osDelay(180);
 
   nextWake = osKernelGetTickCount();
@@ -614,13 +690,34 @@ void StartSensorTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
-
     osMutexAcquire(i2cMutex, osWaitForever);
-    reading.bmeOk = (bme280_get_sensor_data(BME280_ALL, &data, &dev) == BME280_OK);
+
+    /* NEW: if the BME280 reset (e.g. a power glitch), it falls back to
+       sleep mode and stops measuring. Detect that and restart it. */
+    if (bme280_get_sensor_mode(&mode, &dev) != BME280_OK ||
+        mode != BME280_POWERMODE_NORMAL)
+    {
+      rslt = bme_setup(&dev);
+      if (rslt != BME280_OK)
+      {
+        /* The bus may be stuck after the glitch: reset I2C and try again */
+        i2c_bus_recover();
+        rslt = bme_setup(&dev);
+      }
+      /* A glitch likely reset the BH1750 too, so resend its mode command */
+      HAL_I2C_Master_Transmit(&hi2c1, 0x23 << 1, &cmd, 1, 100);
+      printf("BME280 recovered (setup result %d)\r\n", rslt);
+      reading.bmeOk = 0;       /* data is stale this cycle, skip it */
+    }
+    else
+    {
+      reading.bmeOk = (bme280_get_sensor_data(BME280_ALL, &data, &dev) == BME280_OK);
+    }
+
     reading.lightOk = (HAL_I2C_Master_Receive(&hi2c1, 0x23 << 1, buf, 2, 100) == HAL_OK);
     osMutexRelease(i2cMutex);
 
-
+    /* MQ-135 on the ADC (not I2C, so no mutex needed) */
     HAL_ADC_Start(&hadc);
     if (HAL_ADC_PollForConversion(&hadc, 10) == HAL_OK)
       reading.airRaw = (uint16_t)HAL_ADC_GetValue(&hadc);
@@ -632,14 +729,17 @@ void StartSensorTask(void *argument)
     reading.humidity = data.humidity;
     reading.lux = reading.lightOk ? (uint16_t)(((buf[0] << 8) | buf[1]) * 10 / 12) : 0;
 
+    /* Send the reading to DisplayTask (don't wait if the queue is full) */
     osMessageQueuePut(sensorQueue, &reading, 0, 0);
 
+    /* Wake AlertTask if a threshold is crossed */
     if ((reading.bmeOk && reading.temperature > TEMP_ALERT_CENTI) ||
         reading.airRaw > AIR_ALERT_RAW)
     {
       osSemaphoreRelease(alertSem);
     }
 
+    /* Periodic: run exactly every 1000 ms */
     nextWake += 1000;
     osDelayUntil(nextWake);
   }
@@ -673,6 +773,7 @@ void StartAlertTask(void *argument)
   }
   /* USER CODE END StartAlertTask */
 }
+
 /* USER CODE BEGIN Header_StartDisplayTask */
 /**
 * @brief Function implementing the DisplayTask thread.
@@ -741,6 +842,29 @@ void StartDisplayTask(void *argument)
     osMutexRelease(i2cMutex);
   }
   /* USER CODE END StartDisplayTask */
+}
+
+/* USER CODE BEGIN Header_StartMotionTask */
+/**
+* @brief Function implementing the MotionTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartMotionTask */
+void StartMotionTask(void *argument)
+{
+  /* USER CODE BEGIN StartMotionTask */
+  uint32_t count = 0;
+
+  /* Infinite loop */
+  for(;;)
+  {
+    /* Sleep until the PIR interrupt releases the semaphore */
+    osSemaphoreAcquire(motionSem, osWaitForever);
+    count++;
+    printf("Motion detected (#%lu) at %lu ms\r\n", count, osKernelGetTickCount());
+  }
+  /* USER CODE END StartMotionTask */
 }
 
 /**
